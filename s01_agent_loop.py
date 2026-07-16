@@ -38,9 +38,9 @@ INBOX_DIR = TEAM_DIR / "inbox"   #子agent通信地址
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
-    "shutdown_request", # 未扩展
+    "shutdown_request",
     "shutdown_response",
-    "plan_approval_response",  # 未扩展
+    "plan_approval_response",
 } # 子agent允许的消息类型
 # ——————————————————————————————skill的存取——————————————————————————————————————————————
 
@@ -98,7 +98,8 @@ class SkillLoader:
 
 
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
-SYSTEM = f"""You should call me 主人,You are a coding agent at {WORKDIR}. Plan the tasks to finish the work.
+SYSTEM = f"""You should call me 主人,You are a team lead at {WORKDIR}. 
+Manage teammates with shutdown and plan approval protocols.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 Skills available:
 {SKILL_LOADER.get_descriptions()}
@@ -108,7 +109,7 @@ Skills available:
 """
 
 
-# ————————————————————————————————tool函数（bash与文件读写）————————————————————————————————————
+# ————————————————————————————————tool函数————————————————————————————————————
 # 防止路径溢出
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -161,6 +162,36 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
+
+# 子agent关闭请求
+def handle_shutdown_request(teammate: str) -> str:
+    req_id = str(uuid.uuid4())[:8]
+    with _tracker_lock:
+        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
+    BUS.send(
+        "lead", teammate, "Please shut down gracefully.",
+        "shutdown_request", {"request_id": req_id},
+    )
+    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
+
+# 对子agent发来的计划进行审阅
+def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
+    with _tracker_lock:
+        req = plan_requests.get(request_id)
+    if not req:
+        return f"Error: Unknown plan request_id '{request_id}'"
+    with _tracker_lock:
+        req["status"] = "approved" if approve else "rejected"
+    BUS.send(
+        "lead", req["from"], feedback, "plan_approval_response",
+        {"request_id": request_id, "approve": approve, "feedback": feedback},
+    )
+    return f"Plan {req['status']} for '{req['from']}'"
+
+# 检验子agent对shutdown请求的处理结果
+def _check_shutdown_status(request_id: str) -> str:
+    with _tracker_lock:
+        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
 
 
 # 进度矫正和展示工具
@@ -367,6 +398,9 @@ TOOL_HANDLERS = {
     "send_message":    lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
     "read_inbox":      lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
     "broadcast":       lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
+    "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
+    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
+    "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
 
 }
 
@@ -405,7 +439,14 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "broadcast", "description": "Send a message to all teammates.",
      "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
+    {"name": "shutdown_request", "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
+     "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
+    {"name": "shutdown_response", "description": "Check the status of a shutdown request by request_id.",
+     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
+    {"name": "plan_approval", "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
+     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
 ]
+
 
 # —————————————————————————— 模型上下文的压缩管理————————————————————————————————
 # token估算
@@ -520,6 +561,9 @@ class MessageBus:
 
 BUS = MessageBus(INBOX_DIR)
 
+shutdown_requests = {}
+plan_requests = {}
+_tracker_lock = threading.Lock()
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -565,7 +609,8 @@ class TeammateManager:
     def _teammate_loop(self, name: str, role: str, prompt: str):
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
-            f"Use send_message to communicate. Complete your task."
+            f"Submit plans via plan_approval before major work. "
+            f"Respond to shutdown_request with shutdown_response."
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
@@ -616,6 +661,27 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
+        if tool_name == "shutdown_response":
+            req_id = args["request_id"]
+            approve = args["approve"]
+            with _tracker_lock:
+                if req_id in shutdown_requests:
+                    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
+            BUS.send(
+                sender, "lead", args.get("reason", ""),
+                "shutdown_response", {"request_id": req_id, "approve": approve},
+            )
+            return f"Shutdown {'approved' if approve else 'rejected'}"
+        if tool_name == "plan_approval":
+            plan_text = args.get("plan", "")
+            req_id = str(uuid.uuid4())[:8]
+            with _tracker_lock:
+                plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
+            BUS.send(
+                sender, "lead", plan_text, "plan_approval_response",
+                {"request_id": req_id, "plan": plan_text},
+            )
+            return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -633,6 +699,11 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
             {"name": "read_inbox", "description": "Read and drain your inbox.",
              "input_schema": {"type": "object", "properties": {}}},
+            {"name": "shutdown_response","description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
+             "input_schema": {"type": "object","properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"},
+            "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
+            {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
+             "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
         ]
 
     def list_all(self) -> str:
@@ -675,6 +746,16 @@ def agent_loop(messages: list):
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
+        inbox = BUS.read_inbox("lead")
+        if inbox:
+            messages.append({
+                "role": "user",
+                "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
+            })
+            messages.append({
+                "role": "assistant",
+                "content": "Noted inbox messages.",
+            })
         try:
             response = client.messages.create(
                 model=MODEL, system=SYSTEM, messages=messages,
@@ -726,11 +807,17 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input("\033[36ms10 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if query.strip() == "/team":
+            print(TEAM.list_all())
+            continue
+        if query.strip() == "/inbox":
+            print(json.dumps(BUS.read_inbox("lead"), indent=2))
+            continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
