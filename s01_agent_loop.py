@@ -38,16 +38,10 @@ INBOX_DIR = TEAM_DIR / "inbox"   #子agent通信地址
 VALID_MSG_TYPES = {
     "message",
     "broadcast",
-    "shutdown_request",
+    "shutdown_request", # 未扩展
     "shutdown_response",
-    "plan_approval_response",
+    "plan_approval_response",  # 未扩展
 } # 子agent允许的消息类型
-shutdown_requests = {}
-plan_requests = {}
-_tracker_lock = threading.Lock()  # shutdown_requests和plan_requests的互斥锁
-_claim_lock = threading.Lock() #对 task 任务文件读写的互斥锁
-POLL_INTERVAL = 5  #空闲的子agent检查 agent通信信息和任务文件的 时间间隔
-IDLE_TIMEOUT = 60 #子agent空闲多长时间后关闭
 # ——————————————————————————————skill的存取——————————————————————————————————————————————
 
 class SkillLoader:
@@ -104,8 +98,7 @@ class SkillLoader:
 
 
 SKILL_LOADER = SkillLoader(SKILLS_DIR)
-SYSTEM = f"""You should call me 主人,You are a team lead at {WORKDIR}. 
-Manage teammates with shutdown and plan approval protocols.
+SYSTEM = f"""You should call me 主人,You are a coding agent at {WORKDIR}. Plan the tasks to finish the work.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
 Skills available:
 {SKILL_LOADER.get_descriptions()}
@@ -115,7 +108,7 @@ Skills available:
 """
 
 
-# ————————————————————————————————tool函数————————————————————————————————————
+# ————————————————————————————————tool函数（bash与文件读写）————————————————————————————————————
 # 防止路径溢出
 def safe_path(p: str) -> Path:
     path = (WORKDIR / p).resolve()
@@ -169,46 +162,6 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-# 子agent关闭请求
-def handle_shutdown_request(teammate: str) -> str:
-    req_id = str(uuid.uuid4())[:8]
-    with _tracker_lock:
-        shutdown_requests[req_id] = {"target": teammate, "status": "pending"}
-    BUS.send(
-        "lead", teammate, "Please shut down gracefully.",
-        "shutdown_request", {"request_id": req_id},
-    )
-    return f"Shutdown request {req_id} sent to '{teammate}' (status: pending)"
-
-# 对子agent发来的计划进行审阅
-def handle_plan_review(request_id: str, approve: bool, feedback: str = "") -> str:
-    with _tracker_lock:
-        req = plan_requests.get(request_id)
-    if not req:
-        return f"Error: Unknown plan request_id '{request_id}'"
-    with _tracker_lock:
-        req["status"] = "approved" if approve else "rejected"
-    BUS.send(
-        "lead", req["from"], feedback, "plan_approval_response",
-        {"request_id": request_id, "approve": approve, "feedback": feedback},
-    )
-    return f"Plan {req['status']} for '{req['from']}'"
-
-# 检验子agent对shutdown请求的处理结果
-def _check_shutdown_status(request_id: str) -> str:
-    with _tracker_lock:
-        return json.dumps(shutdown_requests.get(request_id, {"error": "not found"}))
-
-def claim_task(task_id: int, owner: str) -> str:
-    with _claim_lock:
-        path = TASKS_DIR / f"task_{task_id}.json"
-        if not path.exists():
-            return f"Error: Task {task_id} not found"
-        task = json.loads(path.read_text())
-        task["owner"] = owner
-        task["status"] = "in_progress"
-        path.write_text(json.dumps(task, indent=2))
-    return f"Claimed task #{task_id} for {owner}"
 
 # 进度矫正和展示工具
 class TodoManager:
@@ -391,16 +344,6 @@ class BackgroundManager:
             self._notification_queue.clear()
         return notifs
 
-    def claim_task(task_id: int, owner: str) -> str:
-        with _claim_lock:
-            path = TASKS_DIR / f"task_{task_id}.json"
-            if not path.exists():
-                return f"Error: Task {task_id} not found"
-            task = json.loads(path.read_text())
-            task["owner"] = owner
-            task["status"] = "in_progress"
-            path.write_text(json.dumps(task, indent=2))
-        return f"Claimed task #{task_id} for {owner}"
 
 BG = BackgroundManager()
 
@@ -424,11 +367,7 @@ TOOL_HANDLERS = {
     "send_message":    lambda **kw: BUS.send("lead", kw["to"], kw["content"], kw.get("msg_type", "message")),
     "read_inbox":      lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
     "broadcast":       lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
-    "shutdown_request":  lambda **kw: handle_shutdown_request(kw["teammate"]),
-    "shutdown_response": lambda **kw: _check_shutdown_status(kw.get("request_id", "")),
-    "plan_approval":     lambda **kw: handle_plan_review(kw["request_id"], kw["approve"], kw.get("feedback", "")),
-    "idle":              lambda **kw: "Lead does not idle.",
-    "claim_task":        lambda **kw: claim_task(kw["task_id"], "lead"),
+
 }
 
 TOOLS = [
@@ -466,19 +405,7 @@ TOOLS = [
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "broadcast", "description": "Send a message to all teammates.",
      "input_schema": {"type": "object", "properties": {"content": {"type": "string"}}, "required": ["content"]}},
-    {"name": "shutdown_request", "description": "Request a teammate to shut down gracefully. Returns a request_id for tracking.",
-     "input_schema": {"type": "object", "properties": {"teammate": {"type": "string"}}, "required": ["teammate"]}},
-    {"name": "shutdown_response", "description": "Check the status of a shutdown request by request_id.",
-     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}}, "required": ["request_id"]}},
-    {"name": "plan_approval", "description": "Approve or reject a teammate's plan. Provide request_id + approve + optional feedback.",
-     "input_schema": {"type": "object", "properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"}, "feedback": {"type": "string"}}, "required": ["request_id", "approve"]}},
-    {"name": "idle", "description": "Enter idle state (for lead -- rarely used).",
-     "input_schema": {"type": "object", "properties": {}}},
-    {"name": "claim_task", "description": "Claim a task from the board by ID.",
-     "input_schema": {"type": "object", "properties": {"task_id": {"type": "integer"}}, "required": ["task_id"]}},
 ]
-
-
 
 # —————————————————————————— 模型上下文的压缩管理————————————————————————————————
 # token估算
@@ -593,7 +520,6 @@ class MessageBus:
 
 BUS = MessageBus(INBOX_DIR)
 
-
 class TeammateManager:
     def __init__(self, team_dir: Path):
         self.dir = team_dir
@@ -616,12 +542,6 @@ class TeammateManager:
                 return m
         return None
 
-    def _set_status(self, name: str, status: str):
-        member = self._find_member(name)
-        if member:
-            member["status"] = status
-            self._save_config()
-
     def spawn(self, name: str, role: str, prompt: str) -> str:
         member = self._find_member(name)
         if member:
@@ -642,110 +562,46 @@ class TeammateManager:
         thread.start()
         return f"Spawned '{name}' (role: {role})"
 
-    def scan_unclaimed_tasks(self) -> list:
-        TASKS_DIR.mkdir(exist_ok=True)
-        unclaimed = []
-        for f in sorted(TASKS_DIR.glob("task_*.json")):
-            task = json.loads(f.read_text())
-            if (task.get("status") == "pending"
-                    and not task.get("owner")
-                    and not task.get("blockedBy")):
-                unclaimed.append(task)
-        return unclaimed
-
-    # -- Identity re-injection after compression --
-    def make_identity_block(self,name: str, role: str, team_name: str) -> dict:
-        return {
-            "role": "user",
-            "content": f"<identity>You are '{name}', role: {role}, team: {team_name}. Continue your work.</identity>",
-        }
-
     def _teammate_loop(self, name: str, role: str, prompt: str):
-        team_name = self.config["team_name"]
         sys_prompt = (
-            f"You are '{name}', role: {role}, team: {team_name}, at {WORKDIR}. "
-            f"Use idle tool when you have no more work. You will auto-claim new tasks."
+            f"You are '{name}', role: {role}, at {WORKDIR}. "
+            f"Use send_message to communicate. Complete your task."
         )
         messages = [{"role": "user", "content": prompt}]
         tools = self._teammate_tools()
+        for _ in range(50):
+            inbox = BUS.read_inbox(name)
+            for msg in inbox:
+                messages.append({"role": "user", "content": json.dumps(msg)})
+            try:
+                response = client.messages.create(
+                    model=MODEL,
+                    system=sys_prompt,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=8000,
+                )
+            except Exception:
+                break
+            messages.append({"role": "assistant", "content": response.content})
+            if response.stop_reason != "tool_use":
+                break
+            results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    output = self._exec(name, block.name, block.input)
+                    print(f"  [{name}] {block.name}: {str(output)[:120]}")
+                    results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(output),
+                    })
+            messages.append({"role": "user", "content": results})
+        member = self._find_member(name)
+        if member and member["status"] != "shutdown":
+            member["status"] = "idle"
+            self._save_config()
 
-        while True:
-            # -- WORK PHASE: standard agent loop --
-            for _ in range(50):
-                inbox = BUS.read_inbox(name)
-                for msg in inbox:
-                    if msg.get("type") == "shutdown_request":
-                        self._set_status(name, "shutdown")
-                        return
-                    messages.append({"role": "user", "content": json.dumps(msg)})
-                try:
-                    response = client.messages.create(
-                        model=MODEL,
-                        system=sys_prompt,
-                        messages=messages,
-                        tools=tools,
-                        max_tokens=8000,
-                    )
-                except Exception:
-                    self._set_status(name, "idle")
-                    return
-                messages.append({"role": "assistant", "content": response.content})
-                if response.stop_reason != "tool_use":
-                    break
-                results = []
-                idle_requested = False
-                for block in response.content:
-                    if block.type == "tool_use":
-                        if block.name == "idle":
-                            idle_requested = True
-                            output = "Entering idle phase. Will poll for new tasks."
-                        else:
-                            output = self._exec(name, block.name, block.input)
-                        print(f"  [{name}] {block.name}: {str(output)[:120]}")
-                        results.append({
-                            "type": "tool_result",
-                            "tool_use_id": block.id,
-                            "content": str(output),
-                        })
-                messages.append({"role": "user", "content": results})
-                if idle_requested:
-                    break
-
-            # -- IDLE PHASE: poll for inbox messages and unclaimed tasks --
-            self._set_status(name, "idle")
-            resume = False
-            polls = IDLE_TIMEOUT // max(POLL_INTERVAL, 1)
-            for _ in range(polls):
-                time.sleep(POLL_INTERVAL)
-                inbox = BUS.read_inbox(name)
-                if inbox:
-                    for msg in inbox:
-                        if msg.get("type") == "shutdown_request":
-                            self._set_status(name, "shutdown")
-                            return
-                        messages.append({"role": "user", "content": json.dumps(msg)})
-                    resume = True
-                    break
-                unclaimed = self.scan_unclaimed_tasks()
-                if unclaimed:
-                    task = unclaimed[0]
-                    claim_task(task["id"], name)
-                    task_prompt = (
-                        f"<auto-claimed>Task #{task['id']}: {task['subject']}\n"
-                        f"{task.get('description', '')}</auto-claimed>"
-                    )
-                    if len(messages) <= 3:
-                        messages.insert(0, self.make_identity_block(name, role, team_name))
-                        messages.insert(1, {"role": "assistant", "content": f"I am {name}. Continuing."})
-                    messages.append({"role": "user", "content": task_prompt})
-                    messages.append({"role": "assistant", "content": f"Claimed task #{task['id']}. Working on it."})
-                    resume = True
-                    break
-
-            if not resume:
-                self._set_status(name, "shutdown")
-                return
-            self._set_status(name, "working")
     def _exec(self, sender: str, tool_name: str, args: dict) -> str:
         # these base tools are unchanged from s02
         if tool_name == "bash":
@@ -760,29 +616,6 @@ class TeammateManager:
             return BUS.send(sender, args["to"], args["content"], args.get("msg_type", "message"))
         if tool_name == "read_inbox":
             return json.dumps(BUS.read_inbox(sender), indent=2)
-        if tool_name == "shutdown_response":
-            req_id = args["request_id"]
-            approve = args["approve"]
-            with _tracker_lock:
-                if req_id in shutdown_requests:
-                    shutdown_requests[req_id]["status"] = "approved" if approve else "rejected"
-            BUS.send(
-                sender, "lead", args.get("reason", ""),
-                "shutdown_response", {"request_id": req_id, "approve": approve},
-            )
-            return f"Shutdown {'approved' if approve else 'rejected'}"
-        if tool_name == "plan_approval":
-            plan_text = args.get("plan", "")
-            req_id = str(uuid.uuid4())[:8]
-            with _tracker_lock:
-                plan_requests[req_id] = {"from": sender, "plan": plan_text, "status": "pending"}
-            BUS.send(
-                sender, "lead", plan_text, "plan_approval_response",
-                {"request_id": req_id, "plan": plan_text},
-            )
-            return f"Plan submitted (request_id={req_id}). Waiting for lead approval."
-        if tool_name == "claim_task":
-            return claim_task(args["task_id"], sender)
         return f"Unknown tool: {tool_name}"
 
     def _teammate_tools(self) -> list:
@@ -800,14 +633,6 @@ class TeammateManager:
              "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
             {"name": "read_inbox", "description": "Read and drain your inbox.",
              "input_schema": {"type": "object", "properties": {}}},
-            {"name": "shutdown_response","description": "Respond to a shutdown request. Approve to shut down, reject to keep working.",
-             "input_schema": {"type": "object","properties": {"request_id": {"type": "string"}, "approve": {"type": "boolean"},
-            "reason": {"type": "string"}}, "required": ["request_id", "approve"]}},
-            {"name": "plan_approval", "description": "Submit a plan for lead approval. Provide plan text.",
-             "input_schema": {"type": "object", "properties": {"plan": {"type": "string"}}, "required": ["plan"]}},
-            {"name": "idle", "description": "Signal that you have no more work. Enters idle polling phase.",
-             "input_schema": {"type": "object", "properties": {}}},
-
         ]
 
     def list_all(self) -> str:
@@ -850,16 +675,6 @@ def agent_loop(messages: list):
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
-        inbox = BUS.read_inbox("lead")
-        if inbox:
-            messages.append({
-                "role": "user",
-                "content": f"<inbox>{json.dumps(inbox, indent=2)}</inbox>",
-            })
-            messages.append({
-                "role": "assistant",
-                "content": "Noted inbox messages.",
-            })
         try:
             response = client.messages.create(
                 model=MODEL, system=SYSTEM, messages=messages,
@@ -911,25 +726,11 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36ms10 >> \033[0m")
+            query = input("\033[36ms01 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        if query.strip() == "/team":
-            print(TEAM.list_all())
-            continue
-        if query.strip() == "/inbox":
-            print(json.dumps(BUS.read_inbox("lead"), indent=2))
-            continue
-        if query.strip() == "/tasks":
-            TASKS_DIR.mkdir(exist_ok=True)
-            for f in sorted(TASKS_DIR.glob("task_*.json")):
-                t = json.loads(f.read_text())
-                marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(t["status"], "[?]")
-                owner = f" @{t['owner']}" if t.get("owner") else ""
-                print(f"  {marker} #{t['id']}: {t['subject']}{owner}")
-            continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
